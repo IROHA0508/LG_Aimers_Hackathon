@@ -33,6 +33,13 @@ TARGET_COL = "control_success"
 N_FOLDS = 5
 SEED = 42
 
+# GPU 사용 여부. 로컬에 NVIDIA GPU + CUDA 드라이버가 잡히면 True로.
+# LightGBM은 기본 pip 설치본에 GPU가 안 켜져 있는 경우가 많아 별도 빌드가 필요할 수 있음
+# (XGBoost, CatBoost는 보통 pip 설치본으로도 바로 GPU 사용 가능).
+USE_GPU_XGB = True
+USE_GPU_CAT = True
+USE_GPU_LGB = False  # 특별한 이유 없으면 False 권장 (설정 난이도 대비 효과가 낮음)
+
 CAT_COLS = ["top_bottom", "game_type", "base_state",
             "pitcher_hand", "batter_hand"]
 
@@ -148,6 +155,10 @@ def train_lgb(X, y, X_full, cat_features, n_folds=N_FOLDS, seed=SEED):
         feature_fraction=0.8, bagging_fraction=0.8, bagging_freq=1,
         lambda_l2=5.0, max_depth=-1, verbose=-1, seed=seed,
     )
+    if USE_GPU_LGB:
+        # 이 옵션이 동작하려면 GPU 지원이 활성화된 LightGBM 빌드가 필요함
+        # (기본 `pip install lightgbm`은 CPU 전용인 경우가 많음)
+        params.update(device="gpu", gpu_platform_id=0, gpu_device_id=0)
     for fold, (tr_idx, va_idx) in enumerate(skf.split(X, y)):
         tr_set = lgb.Dataset(X.iloc[tr_idx], y[tr_idx], categorical_feature=cat_features)
         va_set = lgb.Dataset(X.iloc[va_idx], y[va_idx], categorical_feature=cat_features)
@@ -171,6 +182,10 @@ def train_xgb(X, y, cat_features, n_folds=N_FOLDS, seed=SEED):
         subsample=0.8, colsample_bytree=0.8, reg_lambda=5.0,
         tree_method="hist", enable_categorical=True, seed=seed,
     )
+    if USE_GPU_XGB:
+        # xgboost>=2.0 기준 문법. tree_method는 "hist" 유지하고 device만 cuda로.
+        # (예전 버전이면 tree_method="gpu_hist" 로 대체)
+        params.update(device="cuda")
     for fold, (tr_idx, va_idx) in enumerate(skf.split(X, y)):
         dtr = xgb.DMatrix(X.iloc[tr_idx], label=y[tr_idx], enable_categorical=True)
         dva = xgb.DMatrix(X.iloc[va_idx], label=y[va_idx], enable_categorical=True)
@@ -190,12 +205,15 @@ def train_cat(X, y, cat_features, n_folds=N_FOLDS, seed=SEED):
     for fold, (tr_idx, va_idx) in enumerate(skf.split(X, y)):
         tr_pool = Pool(X.iloc[tr_idx], y[tr_idx], cat_features=cat_features)
         va_pool = Pool(X.iloc[va_idx], y[va_idx], cat_features=cat_features)
-        model = CatBoostClassifier(
+        cat_params = dict(
             iterations=4000, learning_rate=0.03, depth=8,
             l2_leaf_reg=5.0, loss_function="Logloss",
             eval_metric="Logloss", random_seed=seed,
             early_stopping_rounds=200, verbose=False,
         )
+        if USE_GPU_CAT:
+            cat_params.update(task_type="GPU", devices="0")
+        model = CatBoostClassifier(**cat_params)
         model.fit(tr_pool, eval_set=va_pool, use_best_model=True)
         oof[va_idx] = model.predict_proba(X.iloc[va_idx])[:, 1]
         models.append(model)
