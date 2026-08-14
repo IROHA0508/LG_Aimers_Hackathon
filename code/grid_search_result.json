@@ -1,0 +1,21 @@
+{
+  "default_params": {
+    "learning_rate": 0.03,
+    "num_leaves": 63,
+    "min_data_in_leaf": 200,
+    "feature_fraction": 0.8,
+    "bagging_fraction": 0.8,
+    "lambda_l2": 5.0
+  },
+  "default_brier": 0.24375911067615766,
+  "best_params": {
+    "learning_rate": 0.02,
+    "num_leaves": 127,
+    "min_data_in_leaf": 400,
+    "feature_fraction": 0.6,
+    "bagging_fraction": 0.8,
+    "lambda_l2": 10.0
+  },
+  "best_brier": 0.2436237127551881,
+  "improvement_pct": 0.055545788870817105
+}

@@ -367,7 +367,8 @@ def build_features(df, trackman_prior=None,
 # ============================================================
 
 def train_lgb(X, y, X_full, cat_features, n_folds=N_FOLDS, seed=SEED,
-              params_override=None, early_stopping_rounds=200, verbose_fold=True):
+              params_override=None, early_stopping_rounds=200, verbose_fold=True,
+              num_boost_round=4000):
     oof = np.zeros(len(X))
     models = []
     skf = StratifiedKFold(n_splits=n_folds, shuffle=True, random_state=seed)
@@ -388,13 +389,13 @@ def train_lgb(X, y, X_full, cat_features, n_folds=N_FOLDS, seed=SEED,
         tr_set = lgb.Dataset(X.iloc[tr_idx], y[tr_idx], categorical_feature=cat_features)
         va_set = lgb.Dataset(X.iloc[va_idx], y[va_idx], categorical_feature=cat_features)
         try:
-            model = lgb.train(gpu_params, tr_set, num_boost_round=4000,
+            model = lgb.train(gpu_params, tr_set, num_boost_round=num_boost_round,
                                valid_sets=[va_set],
                                callbacks=[lgb.early_stopping(early_stopping_rounds, verbose=False)])
         except lgb.basic.LightGBMError as e:
             if gpu_params.get("device") == "gpu":
                 print(f"  [LGB] GPU 실패({e}) -> CPU로 재시도")
-                model = lgb.train(params, tr_set, num_boost_round=4000,
+                model = lgb.train(params, tr_set, num_boost_round=num_boost_round,
                                    valid_sets=[va_set],
                                    callbacks=[lgb.early_stopping(early_stopping_rounds, verbose=False)])
             else:
