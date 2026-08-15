@@ -1,10 +1,26 @@
 # train_ensemble.py
 # ------------------------------------------------------------
 # 투구 제구 성공 확률 예측 - 학습 파이프라인
-# 전략: LightGBM + XGBoost + CatBoost 앙상블
+# 전략(v2, 최종 채택): LightGBM(튜닝됨) + Entity-Embedding MLP(딥러닝) 2모델 앙상블
 #       -> OOF 예측 생성 -> Isotonic 확률보정 -> Logistic 메타러너 스태킹
 # 평가지표(Brier Skill Score)는 판별력보다 "보정 품질"에 민감하므로
 # 보정 단계를 파이프라인 필수 스텝으로 둔다.
+#
+# final_check.py / rf_check.py / lr_check.py / mlp_check.py / full_stack_check.py로
+# 전체 데이터 기준 비교한 결과(2026-08-15~16, 상세 내역은 README.md 참고):
+#   LightGBM 단독              : score=2397.8
+#   LGB+XGB+CAT 3모델 스태킹   : score=2381.9  (LGB 단독보다 -15.9, 희석효과)
+#   LGB+RF 2모델 스태킹        : score=2409.2  (LGB 단독보다 +11.4)
+#   LGB+RF+LR 3모델 스태킹     : score=2394.6  (2way보다 -14.5, LR이 다양성도 크지 않은데 성능만 나빠 희석)
+#   LGB+MLP 2모델 스태킹       : score=2411.4  (LGB 단독보다 +13.7, 지금까지 최고점 -> 최종 채택)
+#   LGB+RF+MLP 3모델 스태킹    : score=2411.6  (LGB+MLP보다 +0.1, RF-MLP 상관계수 0.901로 중복 -> 기각)
+# 핵심 교훈: 스태킹 이득은 "단독 성능"이 아니라 "LGB와의 오차 상관관계"가 결정한다.
+# XGB/CAT은 LGB와 같은 부스팅 계열이라 상관관계가 높아(추정) 손해였고, RF/MLP는
+# 배깅/신경망 기반이라 상관관계가 낮아(0.94/0.87) 단독 성능이 약해도 도움이 됐다.
+# MLP가 RF보다 상관관계가 더 낮아(0.866 vs 0.939) 최종 점수가 더 높았다.
+# 이에 따라 XGB/CAT/RF는 메인 파이프라인에서 제외하고 LGB+MLP 2모델 스태킹을
+# 최종 아키텍처로 채택한다. (train_xgb/train_cat/train_rf/train_lr 함수 자체는
+# 튜닝·실험 근거 보존을 위해 남겨둠)
 #
 # 주의: 이 스크립트는 참가자 로컬/학습 환경에서 실행하는 "학습용" 코드다.
 #       대회의 10분 추론 제한은 script.py(추론 전용)에만 적용되며,
@@ -21,10 +37,17 @@ from sklearn.model_selection import StratifiedKFold
 from sklearn.isotonic import IsotonicRegression
 from sklearn.linear_model import LogisticRegression
 from sklearn.metrics import brier_score_loss
+from sklearn.preprocessing import StandardScaler
+from sklearn.impute import SimpleImputer
 
 import lightgbm as lgb
-import xgboost as xgb
-from catboost import CatBoostClassifier, Pool
+import torch
+import torch.nn as nn
+from torch.utils.data import TensorDataset, DataLoader
+# xgboost/catboost는 최종 아키텍처(LGB+MLP)에서 빠졌으므로 모듈 최상단에서 임포트하지
+# 않는다 - train_xgb/train_cat 함수 내부에서만 지연 임포트한다. 이렇게 해야
+# script.py가 이 모듈을 그대로 import해도 xgboost/catboost 설치 없이 동작한다
+# (제출 시 requirements.txt에서 불필요한 패키지를 뺄 수 있음).
 
 warnings.filterwarnings("ignore")
 
@@ -156,7 +179,44 @@ def build_matchup_features(df, shrink_k=10):
     return df
 
 
-def build_team_features(df):
+def build_train_snapshot_tables(train_df):
+    """train.csv 전체를 다 본 "최종 스냅샷" lookup 테이블 생성 (추론 전용).
+
+    build_team_features 등은 학습 시(TARGET_COL 존재)엔 시점별 누적 as-of 값을
+    쓰지만, 추론 시(test.csv)엔 라벨이 없어 누적을 이어갈 방법이 없다. 대신
+    train.csv를 끝까지 다 본 "최종 상태"를 새 행(test)에 고정 피처로 붙인다.
+    trackman_prior_table과 동일한 논리 - 과거 전체 이력을 미래 데이터의 고정
+    prior로 제공할 뿐 미래 정보를 쓰지 않으므로 리크가 아니다.
+    """
+    tables = {}
+    for team_col, prefix in [("pitcher_team_id", "pitcher_team"),
+                              ("batter_team_id", "batter_team")]:
+        if team_col not in train_df.columns:
+            continue
+        g = train_df.groupby(team_col)[TARGET_COL].agg(n="count", success="sum").reset_index()
+        g[f"asof_{prefix}_n"] = g["n"]
+        g[f"asof_{prefix}_success_rate"] = g["success"] / g["n"]
+        tables[prefix] = g[[team_col, f"asof_{prefix}_n", f"asof_{prefix}_success_rate"]]
+
+    if {"pitcher_team_id", "batter_team_id"}.issubset(train_df.columns):
+        g = (train_df.groupby(["pitcher_team_id", "batter_team_id"])[TARGET_COL]
+             .agg(n="count", success="sum").reset_index())
+        g["asof_team_matchup_n"] = g["n"]
+        g["asof_team_matchup_success_rate"] = g["success"] / g["n"]
+        tables["team_matchup"] = g[["pitcher_team_id", "batter_team_id",
+                                     "asof_team_matchup_n", "asof_team_matchup_success_rate"]]
+
+    if "season" in train_df.columns:
+        g = train_df.groupby("season")[TARGET_COL].agg(n="count", success="sum").reset_index()
+        g["asof_season_success_rate"] = g["success"] / g["n"]
+        tables["season"] = g[["season", "asof_season_success_rate"]]
+        # test.csv 시즌(예: 2025)이 train에 없는 미래 시즌이면 가장 최근 시즌 값으로 대체
+        tables["latest_season_rate"] = g.sort_values("season")["asof_season_success_rate"].iloc[-1]
+
+    return tables
+
+
+def build_team_features(df, snapshot_tables=None):
     """팀 단위 as-of 피처 (leak-free).
 
     선수 개인 단위(asof_pitcher_*, asof_batter_*)와 별개로 팀 전체 단위의
@@ -169,25 +229,32 @@ def build_team_features(df):
     자동으로 그 팀의 누적치로 전환되어 별도 처리가 필요 없다.
 
     matchup 피처와 동일하게 (그룹 내 "현재 행 이전"만 사용) 누수를 방지한다.
+    TARGET_COL이 없으면(추론) snapshot_tables(build_train_snapshot_tables)의
+    고정값을 조인한다.
     """
-    if TARGET_COL not in df.columns:
+    if TARGET_COL in df.columns:
+        df = df.sort_values(ID_COL).reset_index(drop=True)
+        for team_col, prefix in [("pitcher_team_id", "pitcher_team"),
+                                  ("batter_team_id", "batter_team")]:
+            if team_col not in df.columns:
+                continue
+            n = df.groupby(team_col).cumcount()
+            cum_success = df.groupby(team_col)[TARGET_COL].cumsum() - df[TARGET_COL]
+            df[f"asof_{prefix}_n"] = n
+            df[f"asof_{prefix}_success_rate"] = cum_success / n.replace(0, np.nan)
         return df
 
-    df = df.sort_values(ID_COL).reset_index(drop=True)
-
+    if not snapshot_tables:
+        return df
     for team_col, prefix in [("pitcher_team_id", "pitcher_team"),
                               ("batter_team_id", "batter_team")]:
-        if team_col not in df.columns:
+        if team_col not in df.columns or prefix not in snapshot_tables:
             continue
-        n = df.groupby(team_col).cumcount()
-        cum_success = df.groupby(team_col)[TARGET_COL].cumsum() - df[TARGET_COL]
-        df[f"asof_{prefix}_n"] = n
-        df[f"asof_{prefix}_success_rate"] = cum_success / n.replace(0, np.nan)
-
+        df = df.merge(snapshot_tables[prefix], on=team_col, how="left")
     return df
 
 
-def build_team_matchup_features(df):
+def build_team_matchup_features(df, snapshot_tables=None):
     """팀x팀(투수팀 vs 타자팀) as-of 맞대결 피처.
 
     투수-타자 개별 맞대결(build_matchup_features)은 조합이 96,133개라
@@ -195,22 +262,26 @@ def build_team_matchup_features(df):
     조합당 평균 15,365행(최소 292행)으로 표본 규모가 완전히 다르다.
     team 단위 피처(build_team_features)가 성공했던 것과 같은 이유로
     성공 가능성을 기대해볼 수 있다.
+
+    TARGET_COL이 없으면(추론) snapshot_tables의 고정값을 조인한다.
     """
-    if TARGET_COL not in df.columns:
+    if TARGET_COL in df.columns:
+        df = df.sort_values(ID_COL).reset_index(drop=True)
+        grp_key = ["pitcher_team_id", "batter_team_id"]
+        n = df.groupby(grp_key).cumcount()
+        cum_success = df.groupby(grp_key)[TARGET_COL].cumsum() - df[TARGET_COL]
+        df["asof_team_matchup_n"] = n
+        df["asof_team_matchup_success_rate"] = cum_success / n.replace(0, np.nan)
         return df
 
-    df = df.sort_values(ID_COL).reset_index(drop=True)
-
-    grp_key = ["pitcher_team_id", "batter_team_id"]
-    n = df.groupby(grp_key).cumcount()
-    cum_success = df.groupby(grp_key)[TARGET_COL].cumsum() - df[TARGET_COL]
-    df["asof_team_matchup_n"] = n
-    df["asof_team_matchup_success_rate"] = cum_success / n.replace(0, np.nan)
-
+    if not snapshot_tables or "team_matchup" not in snapshot_tables:
+        return df
+    df = df.merge(snapshot_tables["team_matchup"],
+                   on=["pitcher_team_id", "batter_team_id"], how="left")
     return df
 
 
-def build_season_trend_features(df):
+def build_season_trend_features(df, snapshot_tables=None):
     """시즌 기준선 대비 상대 성공률 (era-adjusted rate).
 
     실측 결과 시즌별 control_success 비율이 2019 0.565 -> 2024 0.486로
@@ -222,22 +293,32 @@ def build_season_trend_features(df):
 
     시즌 그룹 크기가 시즌당 평균 24만행으로 매우 커서 콜드스타트(시즌 첫 몇 행)는
     무시할 수준이다.
+
+    TARGET_COL이 없으면(추론) snapshot_tables의 시즌별 최종 성공률을 조인한다.
+    test.csv의 시즌(예: 2025)이 train에 없는 미래 시즌이면 train의 가장 최근
+    시즌 값(latest_season_rate)으로 대체한다 - 추세가 계속될 거란 가정의 근사치.
     """
-    if TARGET_COL not in df.columns:
+    if TARGET_COL in df.columns:
+        df = df.sort_values(ID_COL).reset_index(drop=True)
+        n = df.groupby("season").cumcount()
+        cum_success = df.groupby("season")[TARGET_COL].cumsum() - df[TARGET_COL]
+        season_rate = cum_success / n.replace(0, np.nan)
+        df["asof_season_success_rate"] = season_rate
+        if "asof_pitcher_success_rate" in df.columns:
+            df["pitcher_rate_vs_season"] = df["asof_pitcher_success_rate"] - season_rate
+        if "asof_batter_success_rate" in df.columns:
+            df["batter_rate_vs_season"] = df["asof_batter_success_rate"] - season_rate
         return df
 
-    df = df.sort_values(ID_COL).reset_index(drop=True)
-
-    n = df.groupby("season").cumcount()
-    cum_success = df.groupby("season")[TARGET_COL].cumsum() - df[TARGET_COL]
-    season_rate = cum_success / n.replace(0, np.nan)
-
-    df["asof_season_success_rate"] = season_rate
+    if not snapshot_tables or "season" not in snapshot_tables:
+        return df
+    df = df.merge(snapshot_tables["season"], on="season", how="left")
+    df["asof_season_success_rate"] = df["asof_season_success_rate"].fillna(
+        snapshot_tables["latest_season_rate"])
     if "asof_pitcher_success_rate" in df.columns:
-        df["pitcher_rate_vs_season"] = df["asof_pitcher_success_rate"] - season_rate
+        df["pitcher_rate_vs_season"] = df["asof_pitcher_success_rate"] - df["asof_season_success_rate"]
     if "asof_batter_success_rate" in df.columns:
-        df["batter_rate_vs_season"] = df["asof_batter_success_rate"] - season_rate
-
+        df["batter_rate_vs_season"] = df["asof_batter_success_rate"] - df["asof_season_success_rate"]
     return df
 
 
@@ -284,7 +365,15 @@ def build_features(df, trackman_prior=None,
                     use_team_feature=True,
                     use_clutch_feature=False,
                     use_team_matchup_feature=True,
-                    use_season_trend_feature=True):
+                    use_season_trend_feature=True,
+                    snapshot_tables=None, cat_dtype_categories=None):
+    # snapshot_tables: build_train_snapshot_tables(train_df)의 결과. 추론 시(df에
+    # TARGET_COL이 없을 때) 팀/팀맞대결/시즌 as-of 피처를 학습 시점 최종 스냅샷
+    # 고정값으로 채우기 위해 필요 (없으면 이 피처들이 통째로 누락됨).
+    # cat_dtype_categories: 학습 시 {컬럼명: 카테고리 목록} 저장값. 추론 시 pandas
+    # category dtype이 학습 때와 다른 코드로 매겨지는 걸 방지하기 위해 강제 적용
+    # (LightGBM은 카테고리의 문자열이 아니라 내부 정수 코드로 분기를 저장하므로,
+    # 코드가 어긋나면 에러 없이 조용히 틀린 예측을 낸다).
     # use_matchup_feature: 투수-타자 맞대결 as-of 피처(build_matchup_features) 사용 여부.
     # feature_matchup.ipynb에서 검증한 결과 shrink_k(10, 100 모두)와 무관하게
     # 전체 데이터(147만행) 기준 LightGBM Brier가 오히려 소폭 악화됨(-0.07%)이 확인되어
@@ -311,13 +400,13 @@ def build_features(df, trackman_prior=None,
     if use_matchup_feature:
         df = build_matchup_features(df, shrink_k=matchup_shrink_k)
     if use_team_feature:
-        df = build_team_features(df)
+        df = build_team_features(df, snapshot_tables=snapshot_tables)
     if use_clutch_feature:
         df = build_clutch_features(df)
     if use_team_matchup_feature:
-        df = build_team_matchup_features(df)
+        df = build_team_matchup_features(df, snapshot_tables=snapshot_tables)
     if use_season_trend_feature:
-        df = build_season_trend_features(df)
+        df = build_season_trend_features(df, snapshot_tables=snapshot_tables)
 
     # cold-start(표본 0) 결측 플래그 - "정보 없음" 자체가 신호일 수 있음
     for c in RATE_COLS_FOR_MISSING_FLAG:
@@ -353,8 +442,15 @@ def build_features(df, trackman_prior=None,
         df, _ = attach_trackman_prior(df, trackman_prior)
 
     # 범주형 -> category dtype (LightGBM/CatBoost native 지원)
+    # cat_dtype_categories가 주어지면(추론 시) 학습 때의 카테고리 목록/순서를
+    # 그대로 강제 적용한다. LightGBM은 카테고리를 내부 정수 코드로 저장하므로,
+    # df마다 독립적으로 astype("category")하면 코드가 어긋나 조용히 오예측할 수 있다.
     for c in CAT_COLS:
-        if c in df.columns:
+        if c not in df.columns:
+            continue
+        if cat_dtype_categories is not None and c in cat_dtype_categories:
+            df[c] = pd.Categorical(df[c], categories=cat_dtype_categories[c])
+        else:
             df[c] = df[c].astype("category")
 
     drop_cols = [ID_COL, TARGET_COL]
@@ -367,16 +463,23 @@ def build_features(df, trackman_prior=None,
 # ============================================================
 
 def train_lgb(X, y, X_full, cat_features, n_folds=N_FOLDS, seed=SEED,
-              params_override=None, early_stopping_rounds=200, verbose_fold=True,
-              num_boost_round=4000):
+              params_override=None, early_stopping_rounds=300, verbose_fold=True,
+              num_boost_round=8000):
+    # 하이퍼파라미터는 grid_search_lgb.py/_round2/_round3의 3단계 순차 그리드서치로
+    # 튜닝됨 (2-fold 탐색 -> 5-fold 최종검증). 전체 데이터 기준 Brier 개선:
+    # 기본값(튜닝 전) 0.243759 -> 1차 0.243624 -> 2차 0.243497 -> 3차 0.243454
+    # (점수 환산 +122.2점, 이번 세션 전체에서 가장 큰 단일 개선폭). 3차에서 개선폭이
+    # 1/3로 줄어들어(수확체감 + 117개 조합이 같은 2-fold에 과적합될 위험) 3차에서 중단.
+    # learning_rate가 낮아진 만큼 num_boost_round/early_stopping_rounds도 검증에 쓴
+    # 값(8000/300)으로 같이 올림 - 그래야 실제 학습 시에도 충분히 수렴함.
     oof = np.zeros(len(X))
     models = []
     skf = StratifiedKFold(n_splits=n_folds, shuffle=True, random_state=seed)
     params = dict(
         objective="binary", metric="binary_logloss",
-        learning_rate=0.03, num_leaves=63, min_data_in_leaf=200,
-        feature_fraction=0.8, bagging_fraction=0.8, bagging_freq=1,
-        lambda_l2=5.0, max_depth=-1, verbose=-1, seed=seed,
+        learning_rate=0.005, num_leaves=320, min_data_in_leaf=800,
+        feature_fraction=0.5, bagging_fraction=0.8, bagging_freq=1,
+        lambda_l2=10.0, max_depth=-1, verbose=-1, seed=seed,
     )
     if params_override:
         params.update(params_override)
@@ -407,17 +510,27 @@ def train_lgb(X, y, X_full, cat_features, n_folds=N_FOLDS, seed=SEED,
     return models, oof
 
 
-def train_xgb(X, y, cat_features, n_folds=N_FOLDS, seed=SEED):
+def train_xgb(X, y, cat_features, n_folds=N_FOLDS, seed=SEED,
+              params_override=None, early_stopping_rounds=200, verbose_fold=True,
+              num_boost_round=4000):
+    import xgboost as xgb
     # XGBoost native categorical 지원 (enable_categorical=True)
+    # 하이퍼파라미터는 grid_search_xgb.py의 2단계 순차 그리드서치로 튜닝됨
+    # (2-fold 탐색 -> 5-fold 최종검증). 전체 데이터 기준 Brier: 기본값 0.243809 ->
+    # 튜닝값 0.243708 (점수 환산 +40.5점). max_depth/min_child_weight/colsample_bytree/
+    # reg_lambda는 탐색 경계값으로 나왔으나, CAT이 기본값도 오래 걸려 스킵하기로
+    # 한 것과 같은 이유로 추가 확장 라운드는 진행하지 않음(시간 대비 수확체감 판단).
     oof = np.zeros(len(X))
     models = []
     skf = StratifiedKFold(n_splits=n_folds, shuffle=True, random_state=seed)
     params = dict(
         objective="binary:logistic", eval_metric="logloss",
-        eta=0.03, max_depth=8, min_child_weight=20,
-        subsample=0.8, colsample_bytree=0.8, reg_lambda=5.0,
+        eta=0.02, max_depth=10, min_child_weight=40,
+        subsample=0.8, colsample_bytree=0.6, reg_lambda=10.0,
         tree_method="hist", enable_categorical=True, seed=seed,
     )
+    if params_override:
+        params.update(params_override)
     gpu_params = dict(params)
     if USE_GPU_XGB:
         # xgboost>=2.0 기준 문법. tree_method는 "hist" 유지하고 device만 cuda로.
@@ -427,24 +540,26 @@ def train_xgb(X, y, cat_features, n_folds=N_FOLDS, seed=SEED):
         dtr = xgb.DMatrix(X.iloc[tr_idx], label=y[tr_idx], enable_categorical=True)
         dva = xgb.DMatrix(X.iloc[va_idx], label=y[va_idx], enable_categorical=True)
         try:
-            model = xgb.train(gpu_params, dtr, num_boost_round=4000,
+            model = xgb.train(gpu_params, dtr, num_boost_round=num_boost_round,
                                evals=[(dva, "valid")],
-                               early_stopping_rounds=200, verbose_eval=False)
+                               early_stopping_rounds=early_stopping_rounds, verbose_eval=False)
         except xgb.core.XGBoostError as e:
             if gpu_params.get("device") == "cuda":
                 print(f"  [XGB] GPU 실패({e}) -> CPU로 재시도")
-                model = xgb.train(params, dtr, num_boost_round=4000,
+                model = xgb.train(params, dtr, num_boost_round=num_boost_round,
                                    evals=[(dva, "valid")],
-                                   early_stopping_rounds=200, verbose_eval=False)
+                                   early_stopping_rounds=early_stopping_rounds, verbose_eval=False)
             else:
                 raise
         oof[va_idx] = model.predict(dva, iteration_range=(0, model.best_iteration + 1))
         models.append(model)
-        print(f"  [XGB fold {fold}] brier={brier_score_loss(y[va_idx], oof[va_idx]):.5f}")
+        if verbose_fold:
+            print(f"  [XGB fold {fold}] brier={brier_score_loss(y[va_idx], oof[va_idx]):.5f}")
     return models, oof
 
 
 def train_cat(X, y, cat_features, n_folds=N_FOLDS, seed=SEED):
+    from catboost import CatBoostClassifier, Pool
     oof = np.zeros(len(X))
     models = []
     skf = StratifiedKFold(n_splits=n_folds, shuffle=True, random_state=seed)
@@ -559,12 +674,176 @@ def train_lr(X, y, cat_features, n_folds=N_FOLDS, seed=SEED):
     return models, oof
 
 
+class EntityEmbedMLP(nn.Module):
+    """범주형은 임베딩, 수치형은 concat -> MLP(BatchNorm+Dropout) -> logit.
+    모듈 레벨 클래스로 둬야 한다 - train_mlp 내부 지역 클래스로 두면 joblib/pickle이
+    학습 프로세스 밖(예: script.py)에서 그 클래스 정의를 못 찾아 모델 복원에 실패한다.
+    추론 시엔 이 클래스 정의 + 저장된 state_dict로 모델을 재구성한다(가중치만 저장,
+    표준 PyTorch 배포 방식).
+    """
+    def __init__(self, cat_cardinalities, n_num, hidden_dims, dropout, embed_dim_cap):
+        super().__init__()
+        self.embeds = nn.ModuleList([
+            nn.Embedding(card, min(embed_dim_cap, max(2, (card + 1) // 2)))
+            for card in cat_cardinalities.values()
+        ])
+        in_dim = sum(e.embedding_dim for e in self.embeds) + n_num
+        layers = []
+        for h in hidden_dims:
+            layers += [nn.Linear(in_dim, h), nn.BatchNorm1d(h), nn.ReLU(), nn.Dropout(dropout)]
+            in_dim = h
+        layers.append(nn.Linear(in_dim, 1))
+        self.mlp = nn.Sequential(*layers)
+
+    def forward(self, x_cat, x_num):
+        embs = [e(x_cat[:, i]) for i, e in enumerate(self.embeds)]
+        return self.mlp(torch.cat(embs + [x_num], dim=1)).squeeze(1)
+
+
+def encode_mlp_inputs(X, cat_features, num_cols, cat_maps, num_imputer, scaler):
+    """train_mlp이 학습 시 fit한 전처리(cat_maps/num_imputer/scaler)를 그대로
+    적용해 (cat_codes, num_array)를 만든다. 학습/추론 공용 - 추론 시 미지 카테고리는
+    자동으로 "unknown" 인덱스(len(uniques))로 몰린다(cat_maps에 저장된 매핑 기준).
+    """
+    cat_arr = np.zeros((len(X), len(cat_features)), dtype=np.int64)
+    for i, c in enumerate(cat_features):
+        uniques = cat_maps[c]
+        code_map = {v: i2 for i2, v in enumerate(uniques)}
+        cat_arr[:, i] = X[c].astype(str).map(code_map).fillna(len(uniques)).astype(np.int64)
+    num_arr = num_imputer.transform(X[num_cols])
+    num_arr = scaler.transform(num_arr)
+    return cat_arr, num_arr
+
+
+def train_mlp(X, y, cat_features, n_folds=N_FOLDS, seed=SEED,
+              embed_dim_cap=16, hidden_dims=(256, 128), dropout=0.3,
+              lr=1e-3, batch_size=4096, max_epochs=30, patience=5,
+              verbose_fold=True):
+    """Entity-Embedding MLP. torch만 필요(GPU 자동 사용). 참고: 다수 벤치마크
+    (Grinsztajn et al. 2022 등)에서 GBDT가 정형 데이터 단독 성능은 앞서는 경향이
+    확인돼, 이 모델은 LGB를 이길 목적이 아니라 스태킹 다양성 후보로 검증됐다
+    (lgb-mlp 상관계수 0.866 < lgb-rf 0.939, RF보다 더 큰 스태킹 이득 확인 -> 최종 채택).
+    검증 폴드 brier가 patience 에폭 연속 개선 없으면 조기종료, best 가중치 복원.
+
+    전처리(cat_maps/num_imputer/scaler)는 폴드가 아니라 전체 X 기준으로 한 번만
+    fit한다 - 폴드마다 따로 fit하면 추론 시 어떤 전처리를 재사용해야 할지 알 수
+    없게 되는 문제(초기 버전의 버그)를 피하기 위함. 1.47M행 규모에서 폴드 subset과
+    전체의 중앙값/평균 차이는 무시할 수준이라 성능 영향은 없다.
+
+    반환값의 models는 nn.Module 인스턴스가 아니라 state_dict 리스트다(표준 PyTorch
+    배포 방식 - pickle이 아니라 텐서 딕셔너리라 어디서든 EntityEmbedMLP 클래스만
+    있으면 복원 가능).
+    """
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    num_cols = [c for c in X.columns if c not in cat_features]
+
+    num_imputer = SimpleImputer(strategy="median").fit(X[num_cols])
+    scaler = StandardScaler().fit(num_imputer.transform(X[num_cols]))
+
+    cat_maps = {}
+    cat_cardinalities = {}
+    cat_codes = pd.DataFrame(index=X.index)
+    for c in cat_features:
+        codes, uniques = pd.factorize(X[c].astype(str))
+        codes = np.where(codes == -1, len(uniques), codes)
+        cat_codes[c] = codes
+        cat_maps[c] = list(uniques)
+        cat_cardinalities[c] = len(uniques) + 1
+
+    num_all = scaler.transform(num_imputer.transform(X[num_cols]))
+
+    oof = np.zeros(len(X))
+    state_dicts = []
+    skf = StratifiedKFold(n_splits=n_folds, shuffle=True, random_state=seed)
+    for fold, (tr_idx, va_idx) in enumerate(skf.split(X, y)):
+        cat_tr, cat_va = cat_codes.iloc[tr_idx].values, cat_codes.iloc[va_idx].values
+        num_tr, num_va = num_all[tr_idx], num_all[va_idx]
+
+        tr_ds = TensorDataset(
+            torch.tensor(cat_tr, dtype=torch.long),
+            torch.tensor(num_tr, dtype=torch.float32),
+            torch.tensor(y[tr_idx], dtype=torch.float32),
+        )
+        tr_loader = DataLoader(tr_ds, batch_size=batch_size, shuffle=True)
+
+        cat_va_t = torch.tensor(cat_va, dtype=torch.long, device=device)
+        num_va_t = torch.tensor(num_va, dtype=torch.float32, device=device)
+
+        model = EntityEmbedMLP(cat_cardinalities, len(num_cols), hidden_dims, dropout, embed_dim_cap).to(device)
+        opt = torch.optim.Adam(model.parameters(), lr=lr)
+        loss_fn = nn.BCEWithLogitsLoss()
+
+        best_brier = np.inf
+        best_state = None
+        no_improve = 0
+        for epoch in range(max_epochs):
+            model.train()
+            for xb_cat, xb_num, yb in tr_loader:
+                xb_cat, xb_num, yb = xb_cat.to(device), xb_num.to(device), yb.to(device)
+                opt.zero_grad()
+                loss = loss_fn(model(xb_cat, xb_num), yb)
+                loss.backward()
+                opt.step()
+
+            model.eval()
+            with torch.no_grad():
+                va_pred = torch.sigmoid(model(cat_va_t, num_va_t)).cpu().numpy()
+            va_brier = brier_score_loss(y[va_idx], va_pred)
+            if va_brier < best_brier - 1e-6:
+                best_brier = va_brier
+                best_state = {k: v.clone().cpu() for k, v in model.state_dict().items()}
+                no_improve = 0
+            else:
+                no_improve += 1
+                if no_improve >= patience:
+                    break
+
+        model.load_state_dict({k: v.to(device) for k, v in best_state.items()})
+        model.eval()
+        with torch.no_grad():
+            oof[va_idx] = torch.sigmoid(model(cat_va_t, num_va_t)).cpu().numpy()
+        state_dicts.append(best_state)
+        if verbose_fold:
+            print(f"  [MLP fold {fold}] brier={brier_score_loss(y[va_idx], oof[va_idx]):.5f} (epoch={epoch+1})")
+
+    preprocessor = {
+        "num_cols": num_cols, "cat_features": cat_features,
+        "num_imputer": num_imputer, "scaler": scaler,
+        "cat_maps": cat_maps, "cat_cardinalities": cat_cardinalities,
+        "hidden_dims": hidden_dims, "dropout": dropout, "embed_dim_cap": embed_dim_cap,
+    }
+    return state_dicts, oof, preprocessor
+
+
+def predict_mlp(state_dicts, preprocessor, X):
+    """train_mlp이 저장한 state_dicts+preprocessor로 X를 추론한다 (폴드 평균).
+    학습 때와 동일하게 encode_mlp_inputs로 전처리 -> 각 폴드 state_dict를 로드한
+    EntityEmbedMLP로 예측 -> 폴드 평균."""
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    cat_arr, num_arr = encode_mlp_inputs(
+        X, preprocessor["cat_features"], preprocessor["num_cols"],
+        preprocessor["cat_maps"], preprocessor["num_imputer"], preprocessor["scaler"])
+    cat_t = torch.tensor(cat_arr, dtype=torch.long, device=device)
+    num_t = torch.tensor(num_arr, dtype=torch.float32, device=device)
+
+    preds = np.zeros(len(X))
+    model = EntityEmbedMLP(preprocessor["cat_cardinalities"], len(preprocessor["num_cols"]),
+                            preprocessor["hidden_dims"], preprocessor["dropout"],
+                            preprocessor["embed_dim_cap"]).to(device)
+    for state_dict in state_dicts:
+        model.load_state_dict({k: v.to(device) for k, v in state_dict.items()})
+        model.eval()
+        with torch.no_grad():
+            preds += torch.sigmoid(model(cat_t, num_t)).cpu().numpy()
+    return preds / len(state_dicts)
+
+
 # ============================================================
 # 4) 메인
 # ============================================================
 
 def main():
-    DATA_DIR = "./data"
+    DATA_DIR = "../open/data"
     MODEL_DIR = "./model"
     os.makedirs(MODEL_DIR, exist_ok=True)
 
@@ -584,26 +863,30 @@ def main():
     else:
         print("  -> 스킵 (pitcher_id 매칭률 0% 확인됨, asof_* 컬럼만 사용)")
 
+    print("Build train snapshot lookup tables (팀/팀맞대결/시즌 - 추론 시 test.csv용)...")
+    snapshot_tables = build_train_snapshot_tables(train)
+
     print("Build features...")
     train_feat, feat_cols = build_features(train, prior_table)
     cat_features = [c for c in CAT_COLS if c in feat_cols]
 
+    # 추론 시 test.csv에 동일한 카테고리 코드를 강제 적용하기 위해 학습 시 사용된
+    # 카테고리 목록을 저장한다 (script.py에서 cat_dtype_categories로 재사용).
+    cat_dtype_categories = {c: train_feat[c].cat.categories for c in cat_features}
+
     X = train_feat[feat_cols]
     print(f"  n_features={len(feat_cols)}, n_rows={len(X)}")
 
-    print("Train LightGBM...")
+    print("Train LightGBM (튜닝됨)...")
     lgb_models, lgb_oof = train_lgb(X, y, X, cat_features)
 
-    print("Train XGBoost...")
-    xgb_models, xgb_oof = train_xgb(X, y, cat_features)
-
-    print("Train CatBoost...")
-    cat_models, cat_oof = train_cat(X, y, cat_features)
+    print("Train Entity-Embedding MLP...")
+    mlp_state_dicts, mlp_oof, mlp_preprocessor = train_mlp(X, y, cat_features)
 
     print("Calibrate each model's OOF (Isotonic)...")
     calibrators = {}
     calibrated = {}
-    for name, oof in [("lgb", lgb_oof), ("xgb", xgb_oof), ("cat", cat_oof)]:
+    for name, oof in [("lgb", lgb_oof), ("mlp", mlp_oof)]:
         iso = IsotonicRegression(out_of_bounds="clip")
         iso.fit(oof, y)
         calibrators[name] = iso
@@ -612,7 +895,7 @@ def main():
               f"-> calibrated brier={brier_score_loss(y, calibrated[name]):.5f}")
 
     print("Stack (meta Logistic Regression on calibrated OOF probs)...")
-    meta_X = np.column_stack([calibrated["lgb"], calibrated["xgb"], calibrated["cat"]])
+    meta_X = np.column_stack([calibrated["lgb"], calibrated["mlp"]])
     meta = LogisticRegression()
     meta.fit(meta_X, y)
     stack_pred = meta.predict_proba(meta_X)[:, 1]
@@ -627,17 +910,19 @@ def main():
     print("Save model bundle...")
     bundle = {
         "lgb_models": lgb_models,
-        "xgb_models": xgb_models,
-        "cat_models": cat_models,
+        "mlp_state_dicts": mlp_state_dicts,
+        "mlp_preprocessor": mlp_preprocessor,
         "calibrators": calibrators,
         "meta_model": meta,
         "final_calibrator": final_iso,
         "feat_cols": feat_cols,
         "cat_features": cat_features,
+        "cat_dtype_categories": cat_dtype_categories,  # 추론 시 카테고리 코드 일치용
+        "snapshot_tables": snapshot_tables,  # 추론 시 팀/팀맞대결/시즌 as-of 피처 조인용
         "trackman_prior_table": prior_table,  # inference 시 원본 트랙맨 파일 불필요
     }
     joblib.dump(bundle, os.path.join(MODEL_DIR, "ensemble_bundle.pkl"))
-    print("✅ Saved model/ensemble_bundle.pkl")
+    print("[OK] Saved model/ensemble_bundle.pkl")
 
 
 if __name__ == "__main__":

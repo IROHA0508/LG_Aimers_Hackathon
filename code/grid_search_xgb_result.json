@@ -1,0 +1,21 @@
+{
+  "default_params": {
+    "eta": 0.03,
+    "max_depth": 8,
+    "min_child_weight": 20,
+    "subsample": 0.8,
+    "colsample_bytree": 0.8,
+    "reg_lambda": 5.0
+  },
+  "default_brier": 0.2438094102749632,
+  "best_params": {
+    "eta": 0.02,
+    "max_depth": 10,
+    "min_child_weight": 40.0,
+    "subsample": 0.8,
+    "colsample_bytree": 0.6,
+    "reg_lambda": 10.0
+  },
+  "best_brier": 0.2437084898342622,
+  "improvement_pct": 0.041393168781792236
+}
