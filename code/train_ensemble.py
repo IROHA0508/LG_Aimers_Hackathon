@@ -1,26 +1,28 @@
 # train_ensemble.py
 # ------------------------------------------------------------
 # 투구 제구 성공 확률 예측 - 학습 파이프라인
-# 전략(v2, 최종 채택): LightGBM(튜닝됨) + Entity-Embedding MLP(딥러닝) 2모델 앙상블
-#       -> OOF 예측 생성 -> Isotonic 확률보정 -> Logistic 메타러너 스태킹
+# 전략(v3, 최종 채택): LightGBM(튜닝됨) + RandomForest + Entity-Embedding MLP
+#       3모델 앙상블 -> OOF 예측 생성 -> Isotonic 확률보정 -> Logistic 메타러너 스태킹
 # 평가지표(Brier Skill Score)는 판별력보다 "보정 품질"에 민감하므로
 # 보정 단계를 파이프라인 필수 스텝으로 둔다.
 #
-# final_check.py / rf_check.py / lr_check.py / mlp_check.py / full_stack_check.py로
-# 전체 데이터 기준 비교한 결과(2026-08-15~16, 상세 내역은 README.md 참고):
-#   LightGBM 단독              : score=2397.8
-#   LGB+XGB+CAT 3모델 스태킹   : score=2381.9  (LGB 단독보다 -15.9, 희석효과)
-#   LGB+RF 2모델 스태킹        : score=2409.2  (LGB 단독보다 +11.4)
-#   LGB+RF+LR 3모델 스태킹     : score=2394.6  (2way보다 -14.5, LR이 다양성도 크지 않은데 성능만 나빠 희석)
-#   LGB+MLP 2모델 스태킹       : score=2411.4  (LGB 단독보다 +13.7, 지금까지 최고점 -> 최종 채택)
-#   LGB+RF+MLP 3모델 스태킹    : score=2411.6  (LGB+MLP보다 +0.1, RF-MLP 상관계수 0.901로 중복 -> 기각)
-# 핵심 교훈: 스태킹 이득은 "단독 성능"이 아니라 "LGB와의 오차 상관관계"가 결정한다.
-# XGB/CAT은 LGB와 같은 부스팅 계열이라 상관관계가 높아(추정) 손해였고, RF/MLP는
-# 배깅/신경망 기반이라 상관관계가 낮아(0.94/0.87) 단독 성능이 약해도 도움이 됐다.
-# MLP가 RF보다 상관관계가 더 낮아(0.866 vs 0.939) 최종 점수가 더 높았다.
-# 이에 따라 XGB/CAT/RF는 메인 파이프라인에서 제외하고 LGB+MLP 2모델 스태킹을
-# 최종 아키텍처로 채택한다. (train_xgb/train_cat/train_rf/train_lr 함수 자체는
-# 튜닝·실험 근거 보존을 위해 남겨둠)
+# v2(세션1)까지는 랜덤 K-fold(StratifiedKFold shuffle=True, 2019~2024 전체 섞음)
+# 기준으로 LGB+MLP 2way(score=2411.4)를 최종 채택했었다. 그러나 세션2에서
+# test.csv가 train.csv에 없는 미래 시즌(2025)이라는 점을 확인하고 시간 기반
+# walk-forward(expanding-window, 미래 시즌 홀드아웃) 검증으로 전면 재검증한 결과,
+# 랜덤 K-fold 결론이 다수 뒤집혔다(상세: README.md "세션 2"):
+#   - 팀/팀맞대결/시즌추세 피처 3개(랜덤fold 기준 채택)를 모두 끄면
+#     walk-forward 5-fold 평균이 706.0 -> 903.6(+28%)으로 개선 (세션 전체 최대 개선폭)
+#   - 이 설정 위에서 재검증한 앙상블 조합(walk-forward 5-fold 평균):
+#       LGB 단독=903.6, LGB+MLP=918.1, LGB+RF+MLP 3way=934.0(최종 채택),
+#       LGB+XGB+CAT 3way=914.2, LGB+RF 2way=966.9<RF단독뿐이라 제외
+#     랜덤fold에서는 RF가 MLP와 중복(상관 0.901)돼 기각됐었지만, walk-forward
+#     기준으로는 RF가 데이터가 적은 초기 폴드에서 강해 3way 조합이 최고였다.
+#   - 트랙맨 이력 활용(팀/개인 레벨 모두)도 랜덤fold/단일폴드에서는 개선처럼
+#     보였으나 walk-forward 전체로는 둘 다 악화로 판명(USE_TRACKMAN=False 유지).
+# 핵심 교훈: 이 대회는 미래 시즌 외삽이 핵심이라 랜덤 K-fold 검증 자체가
+# 신뢰할 수 없다 - 모든 피처/모델 결정은 walk-forward 재검증을 거쳐야 한다.
+# (train_xgb/train_cat/train_lr 함수 자체는 튜닝·실험 근거 보존을 위해 남겨둠)
 #
 # 주의: 이 스크립트는 참가자 로컬/학습 환경에서 실행하는 "학습용" 코드다.
 #       대회의 10분 추론 제한은 script.py(추론 전용)에만 적용되며,
@@ -362,10 +364,10 @@ def build_clutch_features(df, shrink_k=30):
 
 def build_features(df, trackman_prior=None,
                     use_matchup_feature=False, matchup_shrink_k=10,
-                    use_team_feature=True,
+                    use_team_feature=False,
                     use_clutch_feature=False,
-                    use_team_matchup_feature=True,
-                    use_season_trend_feature=True,
+                    use_team_matchup_feature=False,
+                    use_season_trend_feature=False,
                     snapshot_tables=None, cat_dtype_categories=None):
     # snapshot_tables: build_train_snapshot_tables(train_df)의 결과. 추론 시(df에
     # TARGET_COL이 없을 때) 팀/팀맞대결/시즌 as-of 피처를 학습 시점 최종 스냅샷
@@ -380,16 +382,15 @@ def build_features(df, trackman_prior=None,
     # 기본값을 False로 둔다. asof_pitcher/batter_success_rate + pitcher_id/batter_id의
     # 암묵적 조합으로 이미 커버되는 정보로 판단, 채택하지 않음.
     #
-    # use_team_feature: 팀 단위 as-of 피처(build_team_features) 사용 여부.
-    # feature_team.ipynb에서 검증한 결과 전체 데이터 기준 LightGBM Brier가
-    # 0.24405 -> 0.24382로 개선(+0.0956%, 지금까지 시도한 피처/모델 변경 중 최대폭)되어
-    # 기본값을 True로 둔다. Feature importance도 상위권(3위, 7위 등)으로 실제 기여 확인됨.
-    #
-    # use_team_matchup_feature / use_season_trend_feature: feature_teammatchup_season.ipynb에서
-    # 검증한 결과(둘을 함께 넣고 확인) 전체 데이터 기준 LightGBM Brier가
-    # 0.243817 -> 0.24376으로 개선(+0.0237%)되어 기본값을 True로 둔다.
-    # Feature importance는 3위/4위로 높게 나오지만(season_success_rate, team_matchup_success_rate)
-    # 실제 개선폭은 팀 피처보다 작음 -> 기존 season/team 피처와 정보가 일부 겹치는 것으로 추정.
+    # use_team_feature / use_team_matchup_feature / use_season_trend_feature:
+    # 세션1은 랜덤 K-fold 기준으로 이 3개를 모두 채택(True)했으나, 세션2에서
+    # walk-forward(expanding-window, 시간순 홀드아웃) 검증으로 재확인한 결과 정반대
+    # 결론이 나왔다 - 랜덤fold에서 좋아보였던 게 실제로는 미래 시즌 예측에 방해였음.
+    # 3개를 모두 False로 끄면 walk-forward 5-fold 평균이 706.0 -> 903.6(+197.6, +28%,
+    # 5폴드 중 4개 개선)으로 세션 전체에서 가장 큰 개선폭이었다. 기본값을 False로 확정.
+    # (README.md "세션 2" 참고. 랜덤 K-fold 검증은 이 대회에서 신뢰도가 낮다 -
+    # test.csv가 train.csv에 없는 미래 시즌(2025)이라 시간 외삽 성능이 핵심인데
+    # 랜덤fold는 그걸 전혀 측정하지 못한다.)
     #
     # use_clutch_feature: feature_clutch.ipynb에서 검증한 결과 전체 데이터 기준
     # LightGBM Brier가 0.243760 -> 0.243790으로 악화됨(-0.0124%)이 확인되어
@@ -883,10 +884,13 @@ def main():
     print("Train Entity-Embedding MLP...")
     mlp_state_dicts, mlp_oof, mlp_preprocessor = train_mlp(X, y, cat_features)
 
+    print("Train RandomForest...")
+    rf_models, rf_oof = train_rf(X, y, cat_features)
+
     print("Calibrate each model's OOF (Isotonic)...")
     calibrators = {}
     calibrated = {}
-    for name, oof in [("lgb", lgb_oof), ("mlp", mlp_oof)]:
+    for name, oof in [("lgb", lgb_oof), ("mlp", mlp_oof), ("rf", rf_oof)]:
         iso = IsotonicRegression(out_of_bounds="clip")
         iso.fit(oof, y)
         calibrators[name] = iso
@@ -895,7 +899,7 @@ def main():
               f"-> calibrated brier={brier_score_loss(y, calibrated[name]):.5f}")
 
     print("Stack (meta Logistic Regression on calibrated OOF probs)...")
-    meta_X = np.column_stack([calibrated["lgb"], calibrated["mlp"]])
+    meta_X = np.column_stack([calibrated["lgb"], calibrated["mlp"], calibrated["rf"]])
     meta = LogisticRegression()
     meta.fit(meta_X, y)
     stack_pred = meta.predict_proba(meta_X)[:, 1]
@@ -912,6 +916,7 @@ def main():
         "lgb_models": lgb_models,
         "mlp_state_dicts": mlp_state_dicts,
         "mlp_preprocessor": mlp_preprocessor,
+        "rf_models": rf_models,
         "calibrators": calibrators,
         "meta_model": meta,
         "final_calibrator": final_iso,

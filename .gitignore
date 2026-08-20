@@ -1,6 +1,5 @@
 open/data/
-open/baseline_submit.zip
-open/submit.zip
+open/*.zip
 code/checkpoints
 code/model/*.pkl
 open/baseline_submit/model/*.pkl

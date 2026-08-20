@@ -2,9 +2,9 @@
 # ------------------------------------------------------------
 # 투구 제구 성공 확률 예측 - 추론 전용 스크립트 (대회 평가 서버에서 실행).
 # 학습 코드는 없음 - model/ensemble_bundle.pkl에 저장된 LightGBM(튜닝됨) +
-# Entity-Embedding MLP 2모델 스태킹(Isotonic 보정 -> Logistic 메타러너)을
-# 그대로 불러와 test.csv에 적용한다. 학습 파이프라인은 code/train_ensemble.py
-# (제출 대상 아님, 대회 10분 추론 제한과 무관).
+# RandomForest + Entity-Embedding MLP 3모델 스태킹(Isotonic 보정 -> Logistic
+# 메타러너)을 그대로 불러와 test.csv에 적용한다. 학습 파이프라인은
+# code/train_ensemble.py (제출 대상 아님, 대회 10분 추론 제한과 무관).
 #
 # data/ 에서 test.csv/sample_submission.csv를 읽고 output/submission.csv를 쓴다.
 # 인터넷 접속 없이 완전히 오프라인으로 동작한다 (모든 가중치/lookup 테이블은
@@ -234,7 +234,8 @@ def main():
     print("Load model bundle...")
     bundle = joblib.load(MODEL_PATH)
     print(f" OK. n_features={len(bundle['feat_cols'])}, "
-          f"lgb_folds={len(bundle['lgb_models'])}, mlp_folds={len(bundle['mlp_state_dicts'])}")
+          f"lgb_folds={len(bundle['lgb_models'])}, mlp_folds={len(bundle['mlp_state_dicts'])}, "
+          f"rf_folds={len(bundle['rf_models'])}")
 
     # ---- 테스트 데이터 로드 ----
     print("Load test data...")
@@ -261,11 +262,16 @@ def main():
         print("Inference MLP...")
         mlp_preds = predict_mlp(bundle["mlp_state_dicts"], bundle["mlp_preprocessor"], X)
 
+        # ---- RandomForest 추론 (5-fold 평균, 각 fold pipeline이 전처리까지 포함) ----
+        print("Inference RandomForest...")
+        rf_preds = np.mean([m.predict_proba(X)[:, 1] for m in bundle["rf_models"]], axis=0)
+
         # ---- 보정 + 스태킹 ----
         print("Calibrate + stack...")
         lgb_c = bundle["calibrators"]["lgb"].predict(lgb_preds)
         mlp_c = bundle["calibrators"]["mlp"].predict(mlp_preds)
-        meta_X = np.column_stack([lgb_c, mlp_c])
+        rf_c = bundle["calibrators"]["rf"].predict(rf_preds)
+        meta_X = np.column_stack([lgb_c, mlp_c, rf_c])
         stack_pred = bundle["meta_model"].predict_proba(meta_X)[:, 1]
         preds = bundle["final_calibrator"].predict(stack_pred)
 
